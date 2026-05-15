@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/* Workforce Pulse — a COO's situation room, not a template.
+   Near-black canvas, one signal colour per headline (time = cyan,
+   money = amber), tabular monospace figures, dense executive grid. */
+
+@theme {
+  --color-canvas: #08090b;
+  --color-panel: #101216;
+  --color-panel-2: #15181d;
+  --color-line: #23272f;
+  --color-line-soft: #1a1d23;
+  --color-ink: #f4f6f8;
+  --color-ink-dim: #aab1bd;
+  --color-ink-faint: #6b7280;
+
+  --color-time: #38e0c8; /* recoverable hours */
+  --color-money: #f5b945; /* recoverable rupees */
+  --color-alert: #ff6b6b; /* anomalies */
+  --color-accent: #6ea8fe;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+* {
+  border-color: var(--color-line);
+}
+
+html {
+  background: var(--color-canvas);
+  color-scheme: dark;
+}
+
+body {
+  background:
+    radial-gradient(
+      900px 480px at 78% -8%,
+      color-mix(in oklab, var(--color-accent) 9%, transparent),
+      transparent 60%
+    ),
+    var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Figures must line up like a financial statement. */
+.tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.01em;
+}
+
+.panel {
+  background: var(--color-panel);
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+}
+
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}
+
+.hairline {
+  border-top: 1px solid var(--color-line-soft);
+}
+
+button {
+  cursor: pointer;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fp-fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.fp-fade {
+  animation: fp-fade 0.22s ease-out both;
+}
