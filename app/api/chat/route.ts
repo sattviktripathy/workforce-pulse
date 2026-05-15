@@ -21,6 +21,10 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Multi-hop tool calling + transient-503 retries can run long; without this
+// Vercel kills the function early and returns a non-JSON 504. We also keep an
+// internal deadline (below) so we always return JSON before this limit.
+export const maxDuration = 60;
 
 // gemini-2.5-flash (not -lite): the lite model frequently ends its turn
 // after a tool result without emitting any answer text. Paid tier is
@@ -49,6 +53,7 @@ interface ToolCallTrace {
 async function sendWithRetry(
   chat: ChatSession,
   message: string | Part[],
+  deadlineAt: number,
   attempts = 4,
 ): Promise<GenerateContentResult> {
   let lastErr: unknown;
@@ -62,8 +67,16 @@ async function sendWithRetry(
         /\b(503|500|unavailable|overloaded|high demand|internal error)\b/i.test(
           msg,
         );
-      if (!transient || i === attempts - 1) throw e;
-      await new Promise((r) => setTimeout(r, 400 * 2 ** i));
+      const delay = 400 * 2 ** i;
+      // Stop retrying if not transient, out of attempts, or the backoff would
+      // push us past the request deadline.
+      if (
+        !transient ||
+        i === attempts - 1 ||
+        Date.now() + delay >= deadlineAt
+      )
+        throw e;
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr;
@@ -143,10 +156,18 @@ export async function POST(req: Request): Promise<Response> {
   let nextMessage: string | Part[] = last.text;
   let reply = "";
   let stoppedEarly = false;
+  // Hard internal deadline, comfortably under maxDuration=60s. When hit we
+  // stop looping and synthesize a grounded answer from whatever tool results
+  // we already have — so the response is always valid JSON, never a 504.
+  const DEADLINE_AT = Date.now() + 52_000;
 
   try {
     for (let hop = 0; hop < MAX_HOPS; hop++) {
-      const result = await sendWithRetry(chat, nextMessage);
+      if (Date.now() >= DEADLINE_AT) {
+        stoppedEarly = true;
+        break;
+      }
+      const result = await sendWithRetry(chat, nextMessage, DEADLINE_AT);
       const calls = result.response.functionCalls();
       if (!calls || calls.length === 0) {
         reply = result.response.text();
@@ -175,21 +196,26 @@ export async function POST(req: Request): Promise<Response> {
     // emitting text. Never return an empty reply: re-prompt once, then fall
     // back to a deterministic, grounded summary of the tool results.
     if (!reply.trim() && toolResults.length > 0) {
-      try {
-        const retry = await sendWithRetry(
-          chat,
-          "Use the tool results already provided to answer the user's question now, in plain text. Do not call any more tools.",
-          2,
-        );
-        if (!retry.response.functionCalls()?.length) {
-          const t = retry.response.text();
-          if (t && t.trim()) reply = t;
+      // Only spend another round-trip on a re-prompt if there's clear time
+      // left; otherwise go straight to the deterministic grounded fallback.
+      if (DEADLINE_AT - Date.now() > 8000) {
+        try {
+          const retry = await sendWithRetry(
+            chat,
+            "Use the tool results already provided to answer the user's question now, in plain text. Do not call any more tools.",
+            DEADLINE_AT,
+            2,
+          );
+          if (!retry.response.functionCalls()?.length) {
+            const t = retry.response.text();
+            if (t && t.trim()) reply = t;
+          }
+        } catch (e) {
+          console.error(
+            "[/api/chat] re-prompt failed:",
+            e instanceof Error ? e.message : String(e),
+          );
         }
-      } catch (e) {
-        console.error(
-          "[/api/chat] re-prompt failed:",
-          e instanceof Error ? e.message : String(e),
-        );
       }
       if (!reply.trim()) {
         reply = synthesizeFallback(last.text, toolResults);
