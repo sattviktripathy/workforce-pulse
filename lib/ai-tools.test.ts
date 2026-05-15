@@ -4,6 +4,7 @@ import path from "node:path";
 import { buildDataset } from "./normalize";
 import { EMPTY_FILTER } from "./metrics";
 import { TOOLS, dispatchTool } from "./ai/tools";
+import { synthesizeFallback } from "./ai/fallback";
 
 const dir = path.join(process.cwd(), "data");
 const csv = readFileSync(path.join(dir, "activity_logs.csv"), "utf8");
@@ -241,5 +242,64 @@ describe("AI tools — get_anomalies", () => {
     const primary = anomalies.find((a) => a.severity === "primary");
     expect(primary?.employeeId).toBe("E010");
     expect(primary?.rows.map((x) => x.rowIndex)).toEqual([87, 187, 215]);
+  });
+});
+
+describe("AI fallback — synthesizeFallback (never empty, always grounded)", () => {
+  it("summarises get_automation_ranking with the top category + tool name", () => {
+    const data = run("get_automation_ranking");
+    const out = synthesizeFallback("highest ROI automation?", [
+      { name: "get_automation_ranking", args: {}, data },
+    ]);
+    expect(out).not.toBe("");
+    expect(out).toMatch(/get_automation_ranking/);
+    const top = (data.rows as { category: string }[])[0];
+    expect(out).toContain(top.category);
+  });
+
+  it("summarises get_headline with the recoverable hours and INR", () => {
+    const data = run("get_headline");
+    const out = synthesizeFallback("how much can we recover?", [
+      { name: "get_headline", args: {}, data },
+    ]);
+    expect(out).not.toBe("");
+    expect(out).toMatch(/get_headline/);
+    expect(out).toMatch(/hours\/month/);
+    expect(out).toMatch(/INR/);
+  });
+
+  it("summarises get_per_employee list with the top employee id", () => {
+    const data = run("get_per_employee");
+    const out = synthesizeFallback("who costs the most?", [
+      { name: "get_per_employee", args: {}, data },
+    ]);
+    expect(out).not.toBe("");
+    expect(out).toMatch(/get_per_employee/);
+    const top = (data.rows as { employeeId: string }[])[0];
+    expect(out).toContain(top.employeeId);
+  });
+
+  it("uses the most recent usable tool result and cites it", () => {
+    const h = run("get_headline");
+    const a = run("get_automation_ranking");
+    const out = synthesizeFallback("q", [
+      { name: "get_headline", args: {}, data: h },
+      { name: "get_automation_ranking", args: {}, data: a },
+    ]);
+    expect(out).toMatch(/get_automation_ranking/);
+  });
+
+  it("skips error envelopes and grounds on the last good result", () => {
+    const good = run("get_headline");
+    const out = synthesizeFallback("q", [
+      { name: "get_headline", args: {}, data: good },
+      { name: "get_time_sink", args: {}, data: { error: "tool failed" } },
+    ]);
+    expect(out).toMatch(/get_headline/);
+    expect(out).not.toBe("");
+  });
+
+  it("returns empty string only when there is nothing to ground on", () => {
+    expect(synthesizeFallback("q", [])).toBe("");
   });
 });

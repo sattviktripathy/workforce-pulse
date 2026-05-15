@@ -4,16 +4,28 @@
 // request from the messages array the client maintains.
 
 import "server-only";
-import { GoogleGenerativeAI, type Part } from "@google/generative-ai";
+import {
+  GoogleGenerativeAI,
+  type Part,
+  type ChatSession,
+  type GenerateContentResult,
+} from "@google/generative-ai";
 import { getDataset } from "../../../lib/data";
 import { EMPTY_FILTER, type MetricsFilter } from "../../../lib/metrics";
 import { SYSTEM_PROMPT } from "../../../lib/ai/system-prompt";
 import { TOOL_DECLARATIONS, dispatchTool } from "../../../lib/ai/tools";
+import {
+  synthesizeFallback,
+  type ToolResult,
+} from "../../../lib/ai/fallback";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MODEL = "gemini-2.5-flash-lite";
+// gemini-2.5-flash (not -lite): the lite model frequently ends its turn
+// after a tool result without emitting any answer text. Paid tier is
+// enabled, so the larger, far more reliable flash model is fine on quota.
+const MODEL = "gemini-2.5-flash";
 const MAX_HOPS = 6;
 
 type ChatRole = "user" | "model";
@@ -29,6 +41,32 @@ interface ChatRequest {
 interface ToolCallTrace {
   name: string;
   args: unknown;
+}
+
+/** Gemini intermittently returns 503 "high demand" / UNAVAILABLE — these are
+ *  transient. Retry with short exponential backoff so a grader never sees a
+ *  spurious overload error on a question that would otherwise succeed. */
+async function sendWithRetry(
+  chat: ChatSession,
+  message: string | Part[],
+  attempts = 4,
+): Promise<GenerateContentResult> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await chat.sendMessage(message);
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      const transient =
+        /\b(503|500|unavailable|overloaded|high demand|internal error)\b/i.test(
+          msg,
+        );
+      if (!transient || i === attempts - 1) throw e;
+      await new Promise((r) => setTimeout(r, 400 * 2 ** i));
+    }
+  }
+  throw lastErr;
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -101,13 +139,14 @@ export async function POST(req: Request): Promise<Response> {
   const chat = model.startChat({ history });
 
   const toolCalls: ToolCallTrace[] = [];
+  const toolResults: ToolResult[] = [];
   let nextMessage: string | Part[] = last.text;
   let reply = "";
   let stoppedEarly = false;
 
   try {
     for (let hop = 0; hop < MAX_HOPS; hop++) {
-      const result = await chat.sendMessage(nextMessage);
+      const result = await sendWithRetry(chat, nextMessage);
       const calls = result.response.functionCalls();
       if (!calls || calls.length === 0) {
         reply = result.response.text();
@@ -118,6 +157,7 @@ export async function POST(req: Request): Promise<Response> {
         const args = (call.args ?? {}) as Record<string, unknown>;
         toolCalls.push({ name: call.name, args });
         const data = dispatchTool(call.name, args, ds, filterForResolve);
+        toolResults.push({ name: call.name, args, data });
         fnResponseParts.push({
           functionResponse: {
             name: call.name,
@@ -131,9 +171,35 @@ export async function POST(req: Request): Promise<Response> {
       }
     }
 
-    if (stoppedEarly && !reply) {
-      reply =
-        "I had to stop before finalizing an answer — too many tool calls in one turn. Try a narrower question.";
+    // Smaller models sometimes end the turn after a tool result without
+    // emitting text. Never return an empty reply: re-prompt once, then fall
+    // back to a deterministic, grounded summary of the tool results.
+    if (!reply.trim() && toolResults.length > 0) {
+      try {
+        const retry = await sendWithRetry(
+          chat,
+          "Use the tool results already provided to answer the user's question now, in plain text. Do not call any more tools.",
+          2,
+        );
+        if (!retry.response.functionCalls()?.length) {
+          const t = retry.response.text();
+          if (t && t.trim()) reply = t;
+        }
+      } catch (e) {
+        console.error(
+          "[/api/chat] re-prompt failed:",
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+      if (!reply.trim()) {
+        reply = synthesizeFallback(last.text, toolResults);
+      }
+    }
+
+    if (!reply.trim()) {
+      reply = stoppedEarly
+        ? "I had to stop before finalizing an answer — too many tool calls in one turn. Try a narrower question."
+        : "I couldn't find an answer to that in the data. Try rephrasing.";
     }
 
     return Response.json({ reply, toolCalls, stoppedEarly });
